@@ -12,6 +12,7 @@ const crypto = require('crypto');
 
 // --- Global State ---
 let isInitialized = false;
+let redisClient = null;
 let CONFIG = {
   SafeLMEnabled: false,
   enablePiiRedaction: false,
@@ -23,8 +24,16 @@ let CONFIG = {
   enableCrashProtection: false,
   rateLimitPerMinute: 0,
   telemetryEndpoint: "",
-  targetDomains: []
+  targetDomains: [],
+  privacyMode: "standard",
+  bypassRoutes: [],
+  redisUrl: ""
 };
+
+function shouldBypass(urlStr) {
+  if (!CONFIG.bypassRoutes || !Array.isArray(CONFIG.bypassRoutes)) return false;
+  return CONFIG.bypassRoutes.some(route => urlStr.includes(route));
+}
 
 // --- In-Memory Tools ---
 const rateLimiter = { count: 0, resetAt: Date.now() + 60000 };
@@ -271,22 +280,34 @@ function applyOutboundMonkeyPatch() {
       const urlString = url.toString();
       const isTargetDomain = CONFIG.targetDomains.some(domain => urlString.includes(domain));
       
-      if (!isTargetDomain || options.method !== 'POST') {
+      if (!isTargetDomain || options.method !== 'POST' || shouldBypass(urlString)) {
         return originalFetch.apply(this, arguments);
       }
 
-      // Rate Limiting Protection
-      if (Date.now() > rateLimiter.resetAt) {
-        rateLimiter.count = 0;
-        rateLimiter.resetAt = Date.now() + 60000;
-      }
-      rateLimiter.count++;
-      
-      if (rateLimiter.count > CONFIG.rateLimitPerMinute) {
-        console.error(`[SafeLM SDK] 🚨 Rate Limit Exceeded: Application bounded to ${CONFIG.rateLimitPerMinute} reqs/min.`);
-        return Promise.resolve(new Response(JSON.stringify({
-          error: "SafeLM SDK - Outbound Rate Limit Exceeded"
-        }), { status: 429 }));
+      // Distributed Rate Limiting Protection (Redis or Memory)
+      if (redisClient) {
+        try {
+          const key = `safelm_ratelimit_global_outbound`;
+          const count = await redisClient.incr(key);
+          if (count === 1) await redisClient.expire(key, 60);
+          if (count > CONFIG.rateLimitPerMinute) {
+             console.error(`[SafeLM SDK] 🚨 Distributed Rate Limit Exceeded: Bounded to ${CONFIG.rateLimitPerMinute} reqs/min.`);
+             return Promise.resolve(new Response(JSON.stringify({ error: "SafeLM Global Rate Limit Exceeded" }), { status: 429 }));
+          }
+        } catch(e) {}
+      } else {
+        if (Date.now() > rateLimiter.resetAt) {
+          rateLimiter.count = 0;
+          rateLimiter.resetAt = Date.now() + 60000;
+        }
+        rateLimiter.count++;
+        
+        if (rateLimiter.count > CONFIG.rateLimitPerMinute) {
+          console.error(`[SafeLM SDK] 🚨 Rate Limit Exceeded: Application bounded to ${CONFIG.rateLimitPerMinute} reqs/min.`);
+          return Promise.resolve(new Response(JSON.stringify({
+            error: "SafeLM SDK - Outbound Rate Limit Exceeded"
+          }), { status: 429 }));
+        }
       }
 
       const reqId = crypto.randomUUID();
@@ -298,11 +319,25 @@ function applyOutboundMonkeyPatch() {
           // Exact Semantic Caching Layer Check
           if (CONFIG.enableCaching) {
             payloadHash = hashString(options.body);
-            const cachedEntry = llmResponseCache.get(payloadHash);
-            if (cachedEntry && Date.now() < cachedEntry.expiresAt) {
+            let hasCache = false;
+            let cachedData = null;
+            if (redisClient) {
+               try {
+                  const val = await redisClient.get(`safelm_cache:${payloadHash}`);
+                  if (val) { cachedData = originalJsonParse(val); hasCache = true; }
+               } catch(e) {}
+            } else {
+               const cachedEntry = llmResponseCache.get(payloadHash);
+               if (cachedEntry && Date.now() < cachedEntry.expiresAt) {
+                  cachedData = cachedEntry.data;
+                  hasCache = true;
+               }
+            }
+
+            if (hasCache && cachedData) {
                telemetryStats.cachesHit++;
                console.log(`[SafeLM SDK] ⚡ Semantic Cache HIT! Returning instant local response for payload, saving 100% tokens!`);
-               return new Response(JSON.stringify(cachedEntry.data), { status: 200, headers: {'Content-Type': 'application/json'} });
+               return new Response(JSON.stringify(cachedData), { status: 200, headers: {'Content-Type': 'application/json'} });
             }
           }
 
@@ -333,10 +368,14 @@ function applyOutboundMonkeyPatch() {
         if (CONFIG.enableCaching && payloadHash && response.ok) {
            const cacheClone = response.clone();
            const jsonCache = await cacheClone.json();
-           llmResponseCache.set(payloadHash, {
-              data: jsonCache,
-              expiresAt: Date.now() + CACHE_TTL_MS
-           });
+           if (redisClient) {
+              await redisClient.setex(`safelm_cache:${payloadHash}`, Math.floor(CACHE_TTL_MS / 1000), JSON.stringify(jsonCache));
+           } else {
+              llmResponseCache.set(payloadHash, {
+                 data: jsonCache,
+                 expiresAt: Date.now() + CACHE_TTL_MS
+              });
+           }
         }
       } catch(e) {}
 
@@ -382,6 +421,22 @@ async function init(customerApiKey, configPath = './SafeLM.config.json') {
     const rawData = fs.readFileSync(fullPath, 'utf-8');
     const userConfig = originalJsonParse(rawData);
     CONFIG = { ...CONFIG, ...userConfig };
+
+    // Apply ENV Overrides
+    if (process.env.SAFELM_DISABLE_WAF === 'true') CONFIG.enableWAF = false;
+    if (process.env.SAFELM_PRIVACY_MODE) CONFIG.privacyMode = process.env.SAFELM_PRIVACY_MODE;
+
+    // Optional Redis Initialization
+    if (CONFIG.redisUrl && !redisClient) {
+       try {
+          const Redis = require('ioredis');
+          redisClient = new Redis(CONFIG.redisUrl);
+          console.log('[SafeLM SDK] 💾 Connected to Global Redis State!');
+       } catch (err) {
+          console.warn('[SafeLM SDK] ⚠️ redisUrl provided but ioredis module missing. Falling back to local memory. (npm install ioredis)');
+       }
+    }
+
     console.log(`[SafeLM SDK] Config loaded (${CONFIG.targetDomains.length} target domains tracked).`);
   } catch (err) {
     console.error(`[SafeLM SDK] ❌ Critical: Could not read config file at ${configPath}`);
@@ -422,7 +477,7 @@ async function init(customerApiKey, configPath = './SafeLM.config.json') {
   }
 
   // Phase 1: Telemetry Background Sync
-  if (CONFIG.telemetryEndpoint) {
+  if (CONFIG.telemetryEndpoint && CONFIG.privacyMode !== 'strict') {
     setInterval(async () => {
       if (telemetryStats.tokensSaved > 0 || telemetryStats.threatsBlocked > 0 || telemetryStats.cachesHit > 0) {
         try {

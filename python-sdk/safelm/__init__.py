@@ -22,6 +22,7 @@ SafeLM.init('YOUR_SafeLM_API_KEY')
 _is_initialized = False
 _original_urlopen = None
 _original_json_loads = json.loads
+_redis_client = None
 
 CONFIG = {
     "SafeLMEnabled": False,
@@ -34,8 +35,16 @@ CONFIG = {
     "enableCrashProtection": False,
     "rateLimitPerMinute": 0,
     "telemetryEndpoint": "",
-    "targetDomains": []
+    "targetDomains": [],
+    "privacyMode": "standard",
+    "bypassRoutes": [],
+    "redisUrl": ""
 }
+
+def _should_bypass(url_str: str) -> bool:
+    routes = CONFIG.get("bypassRoutes", [])
+    if not isinstance(routes, list): return False
+    return any(route in url_str for route in routes)
 
 _rate_limiter = {"count": 0, "reset_at": time.time() + 60}
 _vault_store = {}
@@ -244,19 +253,29 @@ def _SafeLM_intercept_urlopen(url, data=None, timeout=None, **kwargs):
     full_url_str = req_obj.full_url
     
     is_target = any(domain in full_url_str for domain in CONFIG["targetDomains"])
-    if not is_target or req_obj.get_method() != "POST":
+    if not is_target or req_obj.get_method() != "POST" or _should_bypass(full_url_str):
         return _original_urlopen(url, data, timeout, **kwargs)
 
-    # 2. Rate Limiting Protection
-    now = time.time()
-    if now > _rate_limiter["reset_at"]:
-        _rate_limiter["count"] = 0
-        _rate_limiter["reset_at"] = now + 60
-        
-    _rate_limiter["count"] += 1
-    if _rate_limiter["count"] > CONFIG["rateLimitPerMinute"]:
-        logging.error(f"[SafeLM SDK Python] 🚨 Rate Limit Exceeded: Bound to {CONFIG['rateLimitPerMinute']} reqs/min!")
-        return MockResponse(json.dumps({"error": "SafeLM Rate Limit Exceeded"}).encode("utf-8"), 429)
+    # 2. Distributed Rate Limiting Protection (Redis or Memory)
+    if _redis_client:
+        try:
+            key = "safelm_ratelimit_global_outbound"
+            count = _redis_client.incr(key)
+            if count == 1: _redis_client.expire(key, 60)
+            if count > CONFIG["rateLimitPerMinute"]:
+                logging.error(f"[SafeLM SDK Python] 🚨 Distributed Rate Limit Exceeded: Bound to {CONFIG['rateLimitPerMinute']} reqs/min.")
+                return MockResponse(json.dumps({"error": "SafeLM Global Rate Limit Exceeded"}).encode("utf-8"), 429)
+        except Exception: pass
+    else:
+        now = time.time()
+        if now > _rate_limiter["reset_at"]:
+            _rate_limiter["count"] = 0
+            _rate_limiter["reset_at"] = now + 60
+            
+        _rate_limiter["count"] += 1
+        if _rate_limiter["count"] > CONFIG["rateLimitPerMinute"]:
+            logging.error(f"[SafeLM SDK Python] 🚨 Rate Limit Exceeded: Bound to {CONFIG['rateLimitPerMinute']} reqs/min!")
+            return MockResponse(json.dumps({"error": "SafeLM Rate Limit Exceeded"}).encode("utf-8"), 429)
 
     req_id = str(uuid.uuid4())
     body_was_modified = False
@@ -267,11 +286,22 @@ def _SafeLM_intercept_urlopen(url, data=None, timeout=None, **kwargs):
         if req_obj.data is not None:
             if CONFIG["enableCaching"]:
                 payload_hash = hashlib.sha256(req_obj.data).hexdigest()
-                cached_entry = _llm_response_cache.get(payload_hash)
-                if cached_entry and time.time() < cached_entry["expires_at"]:
+                cached_data = None
+                
+                if _redis_client:
+                    try:
+                        val = _redis_client.get(f"safelm_cache:{payload_hash}")
+                        if val: cached_data = _original_json_loads(val)
+                    except Exception: pass
+                else:
+                    cached_entry = _llm_response_cache.get(payload_hash)
+                    if cached_entry and time.time() < cached_entry["expires_at"]:
+                        cached_data = cached_entry["data"]
+                        
+                if cached_data:
                     _telemetry_stats["cachesHit"] += 1
                     print(f"[SafeLM SDK Python] ⚡ Semantic Cache HIT! Returning instant local response for payload.")
-                    return MockResponse(json.dumps(cached_entry["data"]).encode("utf-8"), 200)
+                    return MockResponse(json.dumps(cached_data).encode("utf-8"), 200)
 
             body_json = _original_json_loads(req_obj.data.decode("utf-8"))
             
@@ -302,10 +332,14 @@ def _SafeLM_intercept_urlopen(url, data=None, timeout=None, **kwargs):
         
         if CONFIG["enableCaching"] and payload_hash:
             try:
-                _llm_response_cache[payload_hash] = {
-                    "data": _original_json_loads(resp_str),
-                    "expires_at": time.time() + 3600 # 1 hour TTL
-                }
+                parsed_resp = _original_json_loads(resp_str)
+                if _redis_client:
+                    _redis_client.setex(f"safelm_cache:{payload_hash}", 3600, json.dumps(parsed_resp))
+                else:
+                    _llm_response_cache[payload_hash] = {
+                        "data": parsed_resp,
+                        "expires_at": time.time() + 3600 # 1 hour TTL
+                    }
             except:
                 pass 
                 
@@ -357,6 +391,7 @@ def _subscription_loop(customer_api_key):
 def _telemetry_loop():
     while True:
         time.sleep(60)
+        if CONFIG.get("privacyMode") == "strict": continue
         stats = _telemetry_stats.copy()
         if stats["tokensSaved"] > 0 or stats["threatsBlocked"] > 0 or stats["cachesHit"] > 0:
             endpoint = CONFIG.get("telemetryEndpoint")
@@ -378,7 +413,7 @@ def _SafeLM_excepthook(exc_type, exc_value, exc_traceback):
     logging.error(f"[SafeLM SDK Python] 🛡️ Blocked fatal app crash: {exc_value}")
 
 def init(customer_api_key, config_path="SafeLM.config.json"):
-    global _is_initialized, _original_urlopen, CONFIG
+    global _is_initialized, _original_urlopen, CONFIG, _redis_client
 
     if _is_initialized: return
 
@@ -389,6 +424,21 @@ def init(customer_api_key, config_path="SafeLM.config.json"):
         # Load bypassing WAF
         user_config = _original_json_loads(f.read())
         CONFIG.update(user_config)
+        
+    # Apply ENV Overrides
+    if os.environ.get("SAFELM_DISABLE_WAF") == "true":
+        CONFIG["enableWAF"] = False
+    if os.environ.get("SAFELM_PRIVACY_MODE"):
+        CONFIG["privacyMode"] = os.environ.get("SAFELM_PRIVACY_MODE")
+
+    # Optional Redis Initialization
+    if CONFIG.get("redisUrl") and not _redis_client:
+        try:
+            import redis
+            _redis_client = redis.from_url(CONFIG["redisUrl"], decode_responses=True)
+            print("[SafeLM SDK Python] 💾 Connected to Global Redis State!")
+        except Exception as e:
+            print(f"[SafeLM SDK Python] ⚠️ redisUrl provided but missing 'redis' module. Falling back to memory. (pip install redis)")
         
     if not _verify_subscription(customer_api_key):
         raise ValueError("SafeLM Authentication Error: Invalid API Key provided.")

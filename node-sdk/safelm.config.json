@@ -1,5 +1,5 @@
 {
-  "SafeLMEnabled": true,
+  "safelmEnabled": true,
   "enablePiiRedaction": true,
   "enablePromptCompression": true,
   "enableLLMLingua": true,
@@ -8,7 +8,13 @@
   "enableWAF": true,
   "enableCrashProtection": true,
   "rateLimitPerMinute": 100,
-  "telemetryEndpoint": "https://api.SafeLM.io/v1/telemetry",
+  "telemetryEndpoint": "https://api.safelm.io/v1/telemetry",
+  "privacyMode": "standard",
+  "bypassRoutes": [
+    "/api/upload",
+    "/api/health"
+  ],
+  "redisUrl": "",
   "targetDomains": [
     "api.openai.com",
     "api.anthropic.com",
