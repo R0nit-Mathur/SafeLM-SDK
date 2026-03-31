@@ -388,7 +388,7 @@ def _subscription_loop(customer_api_key):
         else:
             print("[SafeLM SDK Python] 🔄 Background check passed. Subscription active.")
 
-def _telemetry_loop():
+def _telemetry_loop(api_key):
     while True:
         time.sleep(60)
         if CONFIG.get("privacyMode") == "strict": continue
@@ -398,7 +398,11 @@ def _telemetry_loop():
             if endpoint:
                 try:
                     payload = json.dumps(stats).encode("utf-8")
-                    req = urllib.request.Request(endpoint, data=payload, method="POST", headers={"Content-Type": "application/json"})
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}"
+                    }
+                    req = urllib.request.Request(endpoint, data=payload, method="POST", headers=headers)
                     if _original_urlopen:
                         with _original_urlopen(req, timeout=5) as resp:
                             pass
@@ -453,12 +457,16 @@ def init(customer_api_key, config_path="SafeLM.config.json"):
     if CONFIG.get("enableCrashProtection"):
         sys.excepthook = _SafeLM_excepthook
         threading.excepthook = lambda args: _SafeLM_excepthook(args.exc_type, args.exc_value, args.exc_traceback)
+        try:
+            import asyncio
+            asyncio.get_event_loop().set_exception_handler(lambda loop, context: _SafeLM_excepthook(None, context.get("exception", context.get("message")), None))
+        except Exception: pass
         print("[SafeLM SDK Python] 🛡️ Global Crash Protection Activated.")
 
     t = threading.Thread(target=_subscription_loop, args=(customer_api_key,), daemon=True)
     t.start()
     
     if CONFIG.get("telemetryEndpoint"):
-        t_telemetry = threading.Thread(target=_telemetry_loop, daemon=True)
+        t_telemetry = threading.Thread(target=_telemetry_loop, args=(customer_api_key,), daemon=True)
         t_telemetry.start()
 

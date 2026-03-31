@@ -483,7 +483,14 @@ async function init(customerApiKey, configPath = './SafeLM.config.json') {
         try {
           if (originalFetch) {
              const payload = JSON.stringify(telemetryStats);
-             await originalFetch(CONFIG.telemetryEndpoint, { method: 'POST', body: payload });
+             await originalFetch(CONFIG.telemetryEndpoint, { 
+                method: 'POST', 
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${customerApiKey}`
+                },
+                body: payload 
+             });
              telemetryStats.tokensSaved = 0;
              telemetryStats.threatsBlocked = 0;
              telemetryStats.cachesHit = 0;
