@@ -1,0 +1,20 @@
+{
+  "SafeLMEnabled": true,
+  "enablePiiRedaction": true,
+  "enablePromptCompression": true,
+  "enableLLMLingua": true,
+  "enableJsonShorthand": true,
+  "enableCaching": true,
+  "enableWAF": true,
+  "enableCrashProtection": true,
+  "rateLimitPerMinute": 100,
+  "telemetryEndpoint": "https://api.SafeLM.io/v1/telemetry",
+  "targetDomains": [
+    "api.openai.com",
+    "api.anthropic.com",
+    "localhost:4000",
+    "localhost:4001",
+    "localhost:4000/api/v1/llm",
+    "my-custom-llm.internal.com:8080"
+  ]
+}

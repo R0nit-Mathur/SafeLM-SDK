@@ -1,0 +1,19 @@
+{
+  "name": "safelm",
+  "version": "1.0.0",
+  "description": "SafeLM - The Ultimate Zero-Dependency Plug-and-Play Security SDK for LLMs",
+  "main": "safelm.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "llm",
+    "security",
+    "waf",
+    "compression",
+    "safelm",
+    "wrapper"
+  ],
+  "author": "SafeLM Team",
+  "license": "ISC"
+}
